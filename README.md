@@ -4,6 +4,7 @@
 
 Pocket-AP brings the clean, mobile-friendly travel router workflow of [RaspAP](https://raspap.com/) (visual uplink/client topology, sidebar status LEDs, quick Wi-Fi repeater scan & join, dual-band hotspot + QR codes, VPN, DNS ad-blocking, live traffic graphs) directly to OpenWrt routers — while staying **100% synchronized with LuCI and live OpenWrt runtime state** over native `/ubus`.
 
+![Pocket-AP Interface](https://raw.githubusercontent.com/chromefinch/pocket-AP/refs/heads/main/pocket-AP.png)
 Runs cleanly alongside LuCI at **`http://<router-ip>/pocket-ap/`** without modifying or replacing LuCI at `/`.
 
 ## Highlights
