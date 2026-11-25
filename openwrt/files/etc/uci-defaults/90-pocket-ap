@@ -1,0 +1,4 @@
+#!/bin/sh
+# Pocket-AP OpenWrt uci-defaults hook: reload rpcd so pocket-ap ACL and ucode plugin load cleanly.
+/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+exit 0

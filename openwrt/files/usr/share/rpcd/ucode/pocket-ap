@@ -1,0 +1,573 @@
+// Pocket-AP native OpenWrt rpcd ucode backend plugin.
+// Exposes the `pocket-ap` ubus object for travel-router telemetry,
+// safe diagnostics & captive-portal detection, saved Wi-Fi profiles,
+// GL.iNet-style default landing page switching (Pocket-AP <-> LuCI),
+// WireGuard live stats, and lightweight dnsmasq custom adblock management.
+
+'use strict';
+
+import { access, popen, glob, readfile, writefile, open, mkdir, stat, unlink, chmod } from 'fs';
+
+const PERSIST_DIR = '/etc/pocket-ap';
+const ADBLOCK_FILE = '/etc/pocket-ap/adblock-domains.txt';
+const ADBLOCK_BASENAME = 'pocket-ap-adblock.conf';
+const WIFI_PROFILES_FILE = '/etc/pocket-ap/wifi-profiles.json';
+const SWITCH_CFG_FILE = '/etc/pocket-ap/switch.json';
+const SWITCH_LAST_FILE = '/tmp/pocket-ap-switch.last';
+const WWW_INDEX = '/www/index.html';
+const LUCI_INDEX_BACKUP = '/etc/pocket-ap/index.html.luci-orig';
+const POCKET_AP_INDEX_MARKER = '<!-- pocket-ap-landing -->';
+const MAX_ADBLOCK_DOMAINS = 5000;
+const MAX_WIFI_PROFILES = 50;
+
+const POCKET_AP_LANDING_HTML = `<!doctype html>
+${POCKET_AP_INDEX_MARKER}
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="0; url=/pocket-ap/">
+  <title>Pocket-AP</title>
+</head>
+<body style="font-family:sans-serif;padding:2rem;">
+  <p>Redirecting to <a href="/pocket-ap/">Pocket-AP</a>… (<a href="/cgi-bin/luci/">Open LuCI</a>)</p>
+</body>
+</html>
+`;
+
+const DEFAULT_LUCI_HTML = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<meta http-equiv="refresh" content="0; URL=cgi-bin/luci/" />
+</head>
+<body style="background-color: white">
+<a style="color: black; font-family: arial, helvetica, sans-serif;" href="cgi-bin/luci/">LuCI - Lua Configuration Interface</a>
+</body>
+</html>
+`;
+
+function ensurePersistDir() {
+	if (!stat(PERSIST_DIR)) mkdir(PERSIST_DIR, 0o700);
+	else chmod(PERSIST_DIR, 0o700);
+}
+
+function writeSecretFile(path, content) {
+	ensurePersistDir();
+	let f = open(path, 'w', 0o600);
+	if (!f) return false;
+	f.write(content);
+	f.close();
+	chmod(path, 0o600);
+	return true;
+}
+
+function resolveDnsmasqConfDir() {
+	let dirs = glob('/tmp/dnsmasq.*.d') ?? [];
+	if (length(dirs) > 0) return dirs[0];
+	return '/tmp/dnsmasq.d';
+}
+
+function resolveDnsmasqConfPath() {
+	return `${resolveDnsmasqConfDir()}/${ADBLOCK_BASENAME}`;
+}
+
+function shellquote(s) {
+	return `'${replace(s, "'", "'\\''")}'`;
+}
+
+function readTrim(path) {
+	let data = readfile(path);
+	return data ? trim(data) : null;
+}
+
+function readCpuStat() {
+	let raw = readfile('/proc/stat');
+	if (!raw) return null;
+	for (let line in split(raw, '\n')) {
+		if (substr(line, 0, 4) == 'cpu ') {
+			let parts = split(trim(line), /\s+/);
+			let nums = [];
+			for (let i = 1; i < length(parts) && i <= 8; i++)
+				push(nums, +parts[i]);
+			let total = 0;
+			for (let n in nums) total += n;
+			let idle = (nums[3] ?? 0) + (nums[4] ?? 0);
+			return { busy: total - idle, total };
+		}
+	}
+	return null;
+}
+
+function readThermal() {
+	let zones = [];
+	let paths = glob('/sys/class/thermal/thermal_zone*/temp') ?? [];
+	for (let p in paths) {
+		let v = readTrim(p);
+		if (v != null && match(v, /^-?\d+$/)) {
+			let typePath = replace(p, /\/temp$/, '/type');
+			let name = readTrim(typePath) ?? 'thermal';
+			push(zones, { name, temp_c: +v / 1000.0 });
+		}
+	}
+	let max_c = null;
+	for (let z in zones) {
+		if (max_c == null || z.temp_c > max_c) max_c = z.temp_c;
+	}
+	return { max_c, zones };
+}
+
+function detectPkgManager() {
+	if (access('/usr/bin/apk')) return 'apk';
+	if (access('/bin/opkg')) return 'opkg';
+	return 'none';
+}
+
+function hasBinary(paths) {
+	for (let p in paths) {
+		if (access(p)) return true;
+	}
+	return false;
+}
+
+function detectCapabilities() {
+	let pm = detectPkgManager();
+	return {
+		pkg_manager: pm,
+		wireguard: hasBinary(['/usr/bin/wg', '/sbin/wg']) || !!access('/lib/netifd/proto/wireguard.sh'),
+		openvpn: hasBinary(['/usr/sbin/openvpn', '/usr/bin/openvpn']),
+		tailscale: hasBinary(['/usr/sbin/tailscale', '/usr/bin/tailscale']),
+		adblock: !!access('/etc/init.d/adblock'),
+		adblock_fast: !!access('/etc/init.d/adblock-fast'),
+		adguardhome: !!access('/etc/init.d/adguardhome') || hasBinary(['/usr/bin/AdGuardHome']),
+		travelmate: !!access('/etc/init.d/travelmate'),
+		vnstat: hasBinary(['/usr/bin/vnstat', '/usr/sbin/vnstat']),
+		usb_tether: length(glob('/sys/class/net/usb*') ?? []) > 0 ||
+		            length(glob('/sys/class/net/wwan*') ?? []) > 0 ||
+		            !!access('/sys/bus/usb/drivers/rndis_host') ||
+		            !!access('/sys/bus/usb/drivers/cdc_ncm') ||
+		            !!access('/sys/bus/usb/drivers/ipheth'),
+		ping: hasBinary(['/bin/ping', '/usr/bin/ping']),
+		nslookup: hasBinary(['/usr/bin/nslookup', '/bin/nslookup']),
+		traceroute: hasBinary(['/usr/bin/traceroute', '/bin/traceroute'])
+	};
+}
+
+function readWireguardDump() {
+	let wgBin = access('/usr/bin/wg') ? '/usr/bin/wg' : (access('/sbin/wg') ? '/sbin/wg' : null);
+	if (!wgBin) return { installed: false, interfaces: {} };
+
+	let fd = popen(`${wgBin} show all dump 2>/dev/null`);
+	if (!fd) return { installed: true, interfaces: {} };
+	let raw = fd.read('all') ?? '';
+	fd.close();
+
+	let ifaces = {};
+	for (let line in split(raw, '\n')) {
+		if (!length(line)) continue;
+		let cols = split(line, '\t');
+		let name = cols[0];
+		if (!name) continue;
+		if (length(cols) == 5) {
+			ifaces[name] = {
+				public_key: cols[2] == '(none)' ? '' : cols[2],
+				listen_port: +cols[3],
+				peers: []
+			};
+		} else if (length(cols) >= 9) {
+			if (!ifaces[name]) ifaces[name] = { public_key: '', listen_port: 0, peers: [] };
+			push(ifaces[name].peers, {
+				public_key: cols[1],
+				endpoint: cols[3] == '(none)' ? '' : cols[3],
+				allowed_ips: cols[4] == '(none)' ? '' : cols[4],
+				latest_handshake: +cols[5],
+				rx_bytes: +cols[6],
+				tx_bytes: +cols[7],
+				keepalive: cols[8] == 'off' ? 0 : +cols[8]
+			});
+		}
+	}
+	return { installed: true, interfaces: ifaces };
+}
+
+function readTailscaleStatus() {
+	let bin = access('/usr/sbin/tailscale') ? '/usr/sbin/tailscale' :
+	          (access('/usr/bin/tailscale') ? '/usr/bin/tailscale' : null);
+	if (!bin) return { installed: false };
+	let fd = popen(`${bin} status --json 2>/dev/null`);
+	if (!fd) return { installed: true, running: false };
+	let raw = fd.read('all') ?? '';
+	fd.close();
+	try {
+		let j = json(raw);
+		return {
+			installed: true,
+			running: j?.BackendState == 'Running',
+			state: j?.BackendState ?? 'Unknown',
+			ips: j?.TailscaleIPs ?? [],
+			hostname: j?.Self?.HostName ?? ''
+		};
+	} catch (e) {
+		return { installed: true, running: false, state: 'Stopped' };
+	}
+}
+
+function validHost(h) {
+	if (!h || length(h) > 253) return false;
+	return !!match(h, /^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
+}
+
+function validDomain(d) {
+	if (!d || length(d) > 253) return false;
+	return !!match(d, /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/);
+}
+
+function readAdblockDomains() {
+	let raw = readfile(ADBLOCK_FILE);
+	let domains = [];
+	if (raw) {
+		for (let line in split(raw, '\n')) {
+			let d = lc(trim(line));
+			if (length(d) && substr(d, 0, 1) != '#' && validDomain(d))
+				push(domains, d);
+		}
+	}
+	let confPath = resolveDnsmasqConfPath();
+	let enabled = !!access(confPath);
+	return { enabled, count: length(domains), domains, conf_path: confPath };
+}
+
+function syncAdblockConf(enabled, domains) {
+	let confDir = resolveDnsmasqConfDir();
+	let confPath = `${confDir}/${ADBLOCK_BASENAME}`;
+	ensurePersistDir();
+	if (!stat(confDir)) mkdir(confDir, 0o755);
+
+	let clean = [];
+	let seen = {};
+	for (let raw in domains) {
+		if (length(clean) >= MAX_ADBLOCK_DOMAINS) break;
+		let d = lc(trim(`${raw}`));
+		if (validDomain(d) && !seen[d]) {
+			seen[d] = true;
+			push(clean, d);
+		}
+	}
+
+	writefile(ADBLOCK_FILE, join('\n', clean) + (length(clean) ? '\n' : ''));
+
+	if (enabled && length(clean) > 0) {
+		let lines = ['# Generated by Pocket-AP'];
+		for (let d in clean) {
+			push(lines, `address=/${d}/0.0.0.0`);
+			push(lines, `address=/${d}/::`);
+		}
+		writefile(confPath, join('\n', lines) + '\n');
+	} else if (access(confPath)) {
+		unlink(confPath);
+	}
+
+	let reload = popen('/etc/init.d/dnsmasq reload 2>&1');
+	let out = reload ? (reload.read('all') ?? '') : '';
+	if (reload) reload.close();
+
+	return { ok: true, enabled: !!enabled && length(clean) > 0, count: length(clean), domains: clean, conf_path: confPath, output: trim(out) };
+}
+
+function readWifiProfiles() {
+	let raw = readfile(WIFI_PROFILES_FILE);
+	if (!raw) return { profiles: [] };
+	try {
+		let data = json(raw);
+		if (type(data) == 'array') return { profiles: data };
+	} catch (e) {}
+	return { profiles: [] };
+}
+
+function saveWifiProfiles(profiles) {
+	ensurePersistDir();
+	let clean = [];
+	let seen = {};
+	for (let p in profiles) {
+		if (length(clean) >= MAX_WIFI_PROFILES) break;
+		if (type(p) != 'object') continue;
+		let ssid = trim(`${p.ssid ?? ''}`);
+		if (!length(ssid) || length(ssid) > 32) continue;
+		let radioId = trim(`${p.radioId ?? 'radio1'}`);
+		let keyKey = `${ssid}__${radioId}`;
+		if (seen[keyKey]) continue;
+		seen[keyKey] = true;
+		push(clean, {
+			ssid,
+			radioId,
+			bandLabel: trim(`${p.bandLabel ?? ''}`),
+			encryption: trim(`${p.encryption ?? 'psk2'}`),
+			key: `${p.key ?? ''}`,
+			locked: !!p.locked,
+			bssid: trim(`${p.bssid ?? ''}`),
+			savedAt: +p.savedAt || 0
+		});
+	}
+	writeSecretFile(WIFI_PROFILES_FILE, sprintf('%J\n', clean));
+	return { ok: true, profiles: clean };
+}
+
+function getLandingMode() {
+	let raw = readfile(WWW_INDEX) ?? '';
+	let mode = index(raw, POCKET_AP_INDEX_MARKER) >= 0 ? 'pocket-ap' : 'luci';
+	return { mode, luci_url: '/cgi-bin/luci/', pocket_ap_url: '/pocket-ap/' };
+}
+
+function setLandingMode(mode) {
+	ensurePersistDir();
+	if (mode == 'pocket-ap') {
+		let cur = readfile(WWW_INDEX) ?? '';
+		if (length(cur) && index(cur, POCKET_AP_INDEX_MARKER) < 0 && !access(LUCI_INDEX_BACKUP)) {
+			writefile(LUCI_INDEX_BACKUP, cur);
+		}
+		writefile(WWW_INDEX, POCKET_AP_LANDING_HTML);
+		return { ok: true, mode: 'pocket-ap' };
+	}
+	let orig = readfile(LUCI_INDEX_BACKUP) ?? DEFAULT_LUCI_HTML;
+	writefile(WWW_INDEX, orig);
+	return { ok: true, mode: 'luci' };
+}
+
+function readSwitchState() {
+	let supported = false;
+	let rawPos = 'unknown';
+	let gpio = readfile('/sys/kernel/debug/gpio');
+	if (gpio) {
+		for (let line in split(gpio, '\n')) {
+			if (index(line, '|mode') >= 0) {
+				supported = true;
+				if (match(line, /\bin\b.*\bhi\b/)) rawPos = 'on';
+				else if (match(line, /\bin\b.*\blo\b/)) rawPos = 'off';
+				break;
+			}
+		}
+	}
+	let cfg = { action: 'none', wg_iface: 'wg0', vpn_killswitch: false, invert: false };
+	let raw = readfile(SWITCH_CFG_FILE);
+	if (raw) {
+		try {
+			let j = json(raw);
+			if (type(j) == 'object') {
+				if (j.action) cfg.action = `${j.action}`;
+				if (j.wg_iface) cfg.wg_iface = `${j.wg_iface}`;
+				cfg.vpn_killswitch = !!j.vpn_killswitch;
+				cfg.invert = !!j.invert;
+			}
+		} catch (e) {}
+	}
+	let logicalPos = rawPos;
+	if (cfg.invert && rawPos == 'on') logicalPos = 'off';
+	else if (cfg.invert && rawPos == 'off') logicalPos = 'on';
+
+	let last = { at: 0, state: '', action: '', result: '' };
+	let rawLast = readfile(SWITCH_LAST_FILE);
+	if (rawLast) {
+		for (let line in split(rawLast, '\n')) {
+			let m = match(line, /^([A-Z_]+)="?(.*?)"?$/);
+			if (!m) continue;
+			if (m[1] == 'LAST_AT') last.at = +m[2] || 0;
+			else if (m[1] == 'LAST_STATE') last.state = m[2];
+			else if (m[1] == 'LAST_ACTION') last.action = m[2];
+			else if (m[1] == 'LAST_RESULT') last.result = m[2];
+		}
+	}
+
+	return {
+		supported,
+		raw_position: rawPos,
+		position: logicalPos,
+		action: cfg.action,
+		wg_iface: cfg.wg_iface,
+		vpn_killswitch: cfg.vpn_killswitch,
+		invert: cfg.invert,
+		last
+	};
+}
+
+function saveSwitchConfig(args) {
+	let allowed = ['none', 'wifi', 'vpn_wireguard', 'vpn_openvpn', 'reset_defaults'];
+	let action = `${args.action ?? 'none'}`;
+	if (!(action in allowed)) action = 'none';
+	let wg = replace(`${args.wg_iface ?? 'wg0'}`, /[^A-Za-z0-9_]/g, '');
+	if (!length(wg)) wg = 'wg0';
+	let cfg = {
+		action,
+		wg_iface: substr(wg, 0, 15),
+		vpn_killswitch: !!args.vpn_killswitch,
+		invert: !!args.invert
+	};
+	writeSecretFile(SWITCH_CFG_FILE, sprintf('%J\n', cfg));
+	return readSwitchState();
+}
+
+function callPortalHelper(args) {
+	if (!access('/usr/libexec/pocket-ap-portal')) return null;
+	let fd = popen(`/usr/libexec/pocket-ap-portal ${args} 2>/dev/null`);
+	if (!fd) return null;
+	let raw = trim(fd.read('all') ?? '');
+	fd.close();
+	if (!length(raw)) return null;
+	try {
+		return json(raw);
+	} catch (e) {
+		return null;
+	}
+}
+
+const methods = {
+	telemetry: {
+		call: function() {
+			return {
+				version: '0.2.3',
+				cpu: readCpuStat(),
+				thermal: readThermal(),
+				capabilities: detectCapabilities(),
+				wireguard: readWireguardDump(),
+				tailscale: readTailscaleStatus(),
+				landing: getLandingMode(),
+				portal: callPortalHelper('status'),
+				hw_switch: readSwitchState()
+			};
+		}
+	},
+
+	switch_get: {
+		call: function() {
+			return readSwitchState();
+		}
+	},
+
+	switch_set: {
+		args: { action: 'none', wg_iface: 'wg0', vpn_killswitch: false, invert: false },
+		call: function(request) {
+			return saveSwitchConfig(request.args ?? {});
+		}
+	},
+
+	portal_status: {
+		call: function() {
+			return callPortalHelper('status') ?? { active: false };
+		}
+	},
+
+	portal_probe: {
+		call: function() {
+			return callPortalHelper('probe') ?? { active: false };
+		}
+	},
+
+	portal_start: {
+		args: { timeout: 600 },
+		call: function(request) {
+			let t = +request.args.timeout || 600;
+			if (t < 60) t = 60;
+			if (t > 1800) t = 1800;
+			return callPortalHelper(`start ${t}`) ?? { active: false, error: 'Portal helper unavailable' };
+		}
+	},
+
+	portal_stop: {
+		call: function() {
+			return callPortalHelper('stop') ?? { active: false };
+		}
+	},
+
+	diag: {
+		args: { action: 'ping', target: '1.1.1.1' },
+		call: function(request) {
+			let action = request.args.action ?? 'ping';
+			let target = trim(request.args.target ?? '');
+
+			if (action == 'portal_check') {
+				let cmd = 'uclient-fetch -4 -T 5 -O - http://detectportal.firefox.com/success.txt 2>&1';
+				if (!access('/bin/uclient-fetch') && !access('/usr/bin/uclient-fetch'))
+					cmd = 'wget -T 5 -S -O - http://detectportal.firefox.com/success.txt 2>&1';
+				let fd = popen(cmd);
+				let out = fd ? (fd.read('all') ?? '') : '';
+				let rc = fd ? fd.close() : 1;
+				let online = rc == 0 && !!match(out, /(^|\n)success(\r?\n|$)/);
+				let locMatch = match(out, /Location:\s*(\S+)/i) || match(out, /Redirected to\s+(\S+)/i);
+				let rawUrl = locMatch ? locMatch[1] : null;
+				let portalUrl = (rawUrl && match(rawUrl, /^https?:\/\/[^\s"'<>]+$/i)) ? rawUrl : null;
+				return {
+					action,
+					ok: online,
+					captive_suspected: !online && (!!portalUrl || rc == 0),
+					portal_url: portalUrl,
+					rc,
+					output: substr(out, 0, 1024)
+				};
+			}
+
+			if (!validHost(target))
+				return { action, ok: false, error: 'Invalid host or IP address' };
+
+			let cmd = null;
+			if (action == 'ping')
+				cmd = `ping -c 4 -W 3 -- ${shellquote(target)} 2>&1`;
+			else if (action == 'nslookup')
+				cmd = `nslookup ${shellquote(target)} 2>&1`;
+			else if (action == 'traceroute')
+				cmd = `traceroute -m 12 -w 2 -- ${shellquote(target)} 2>&1`;
+			else
+				return { action, ok: false, error: 'Unsupported diagnostic action' };
+
+			let fd = popen(cmd);
+			let out = fd ? (fd.read('all') ?? '') : '';
+			let rc = fd ? fd.close() : 1;
+			return { action, target, ok: rc == 0, rc, output: substr(out, 0, 8192) };
+		}
+	},
+
+	adblock_get: {
+		call: function() {
+			return readAdblockDomains();
+		}
+	},
+
+	adblock_set: {
+		args: { enabled: true, domains: [] },
+		call: function(request) {
+			let enabled = !!request.args.enabled;
+			let domains = type(request.args.domains) == 'array' ? request.args.domains : [];
+			return syncAdblockConf(enabled, domains);
+		}
+	},
+
+	wifi_profiles_get: {
+		call: function() {
+			return readWifiProfiles();
+		}
+	},
+
+	wifi_profiles_save: {
+		args: { profiles: [] },
+		call: function(request) {
+			let profiles = type(request.args.profiles) == 'array' ? request.args.profiles : [];
+			return saveWifiProfiles(profiles);
+		}
+	},
+
+	landing_get: {
+		call: function() {
+			return getLandingMode();
+		}
+	},
+
+	landing_set: {
+		args: { mode: 'luci' },
+		call: function(request) {
+			let mode = request.args.mode == 'pocket-ap' ? 'pocket-ap' : 'luci';
+			return setLandingMode(mode);
+		}
+	}
+};
+
+return { 'pocket-ap': methods };

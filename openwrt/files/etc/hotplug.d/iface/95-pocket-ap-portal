@@ -1,0 +1,9 @@
+#!/bin/sh
+# Pocket-AP hotplug hook: when wwan comes up, probe for a captive portal in the background
+# so the web UI automatically flags a hotel/guest login requirement.
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$INTERFACE" = "wwan" ] || exit 0
+[ -x /usr/libexec/pocket-ap-portal ] || exit 0
+
+( sleep 3; /usr/libexec/pocket-ap-portal probe >/dev/null 2>&1 ) &
+exit 0

@@ -1,0 +1,249 @@
+#!/bin/sh
+# Pocket-AP Hardware Side Toggle Switch Handler (GL.iNet GL-MT3000 BTN_0 / gpio-512)
+# Supported actions in /etc/pocket-ap/switch.json:
+#   none           - Do nothing
+#   vpn_wireguard  - Start/Stop configured WireGuard interface (optional Kill-Switch)
+#   vpn_openvpn    - Start/Stop OpenVPN service
+#   wifi           - Enable/Disable Hotspot Wi-Fi Access Points (syncs both device & AP iface)
+#   reset_defaults - Reset OpenWrt configuration to factory defaults (5-second cancel window)
+
+set -u
+
+CFG_FILE="/etc/pocket-ap/switch.json"
+LAST_FILE="/tmp/pocket-ap-switch.last"
+RESET_PID_FILE="/tmp/pocket-ap-switch-reset.pid"
+
+read_gpio_pos() {
+	if [ -r /sys/kernel/debug/gpio ]; then
+		LINE="$(grep '|mode' /sys/kernel/debug/gpio 2>/dev/null | head -n 1 || true)"
+		case "$LINE" in
+			*" in "*" hi"*) echo "on"; return ;;
+			*" in "*" lo"*) echo "off"; return ;;
+		esac
+	fi
+	echo "unknown"
+}
+
+load_cfg() {
+	SW_ACTION="none"
+	SW_WG_IFACE="wg0"
+	SW_KILLSWITCH="false"
+	SW_INVERT="false"
+	if [ -r "$CFG_FILE" ]; then
+		RAW="$(cat "$CFG_FILE" 2>/dev/null || echo '{}')"
+		A="$(printf '%s' "$RAW" | jsonfilter -e '@.action' 2>/dev/null || true)"
+		W="$(printf '%s' "$RAW" | jsonfilter -e '@.wg_iface' 2>/dev/null || true)"
+		K="$(printf '%s' "$RAW" | jsonfilter -e '@.vpn_killswitch' 2>/dev/null || true)"
+		I="$(printf '%s' "$RAW" | jsonfilter -e '@.invert' 2>/dev/null || true)"
+		[ -n "$A" ] && SW_ACTION="$A"
+		[ -n "$W" ] && SW_WG_IFACE="$W"
+		[ "$K" = "true" ] && SW_KILLSWITCH="true"
+		[ "$I" = "true" ] && SW_INVERT="true"
+	fi
+}
+
+record_event() {
+	cat > "$LAST_FILE" <<EOF
+LAST_AT=$(date +%s)
+LAST_STATE="$1"
+LAST_ACTION="$2"
+LAST_RESULT="$3"
+EOF
+}
+
+set_killswitch_fw() {
+	ENABLE_KS="$1"
+	i=0
+	CHANGED=0
+	while uci -q get "firewall.@forwarding[$i]" >/dev/null 2>&1; do
+		SRC="$(uci -q get "firewall.@forwarding[$i].src" || true)"
+		DST="$(uci -q get "firewall.@forwarding[$i].dest" || true)"
+		if [ "$SRC" = "lan" ] && [ "$DST" = "wan" ]; then
+			if [ "$ENABLE_KS" = "1" ]; then
+				uci -q set "firewall.@forwarding[$i].enabled=0"
+			else
+				uci -q set "firewall.@forwarding[$i].enabled=1"
+			fi
+			CHANGED=1
+			break
+		fi
+		i=$((i + 1))
+	done
+	if [ "$CHANGED" = "1" ]; then
+		uci -q commit firewall
+		/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	fi
+}
+
+do_wifi() {
+	WANT="$1" # on | off
+	if [ "$WANT" = "on" ]; then
+		DIS="0"
+		# Ensure wifi-devices are enabled too
+		for sec in $(uci -q show wireless | sed -nE 's/^wireless\.([^.=]+)=wifi-device$/\1/p'); do
+			uci -q set "wireless.${sec}.disabled=0"
+		done
+	else
+		DIS="1"
+	fi
+
+	# Toggle all AP wifi-iface sections (leave STA repeater interfaces untouched)
+	for sec in $(uci -q show wireless | sed -nE 's/^wireless\.([^.=]+)=wifi-iface$/\1/p'); do
+		MODE="$(uci -q get "wireless.${sec}.mode" || echo 'ap')"
+		if [ "$MODE" = "ap" ]; then
+			uci -q set "wireless.${sec}.disabled=$DIS"
+		fi
+	done
+
+	uci -q commit wireless
+	wifi reload >/dev/null 2>&1 || true
+	logger -t pocket-ap-switch "Hotspot Wi-Fi turned $WANT via hardware switch"
+	record_event "$WANT" "wifi" "Hotspot APs turned $WANT"
+}
+
+do_wireguard() {
+	WANT="$1"
+	IFACE="$SW_WG_IFACE"
+	# Fallback to first configured wireguard interface if specified one doesn't exist
+	if ! uci -q get "network.${IFACE}" >/dev/null 2>&1; then
+		IFACE="$(uci -q show network | sed -nE "s/^network\.([^.=]+)\.proto='wireguard'$/\1/p" | head -n 1 || true)"
+	fi
+	if [ -z "$IFACE" ]; then
+		logger -t pocket-ap-switch "WireGuard toggle skipped: no WireGuard interface configured"
+		record_event "$WANT" "vpn_wireguard" "No WireGuard interface configured"
+		return
+	fi
+
+	if [ "$WANT" = "on" ]; then
+		ifup "$IFACE" >/dev/null 2>&1 || true
+		[ "$SW_KILLSWITCH" = "true" ] && set_killswitch_fw 1
+		logger -t pocket-ap-switch "WireGuard ($IFACE) enabled via hardware switch"
+		record_event "$WANT" "vpn_wireguard" "WireGuard ($IFACE) started"
+	else
+		[ "$SW_KILLSWITCH" = "true" ] && set_killswitch_fw 0
+		ifdown "$IFACE" >/dev/null 2>&1 || true
+		logger -t pocket-ap-switch "WireGuard ($IFACE) disabled via hardware switch"
+		record_event "$WANT" "vpn_wireguard" "WireGuard ($IFACE) stopped"
+	fi
+}
+
+do_openvpn() {
+	WANT="$1"
+	if [ ! -x /etc/init.d/openvpn ]; then
+		logger -t pocket-ap-switch "OpenVPN toggle skipped: openvpn is not installed"
+		record_event "$WANT" "vpn_openvpn" "OpenVPN not installed"
+		return
+	fi
+	if [ "$WANT" = "on" ]; then
+		/etc/init.d/openvpn start >/dev/null 2>&1 || true
+		logger -t pocket-ap-switch "OpenVPN started via hardware switch"
+		record_event "$WANT" "vpn_openvpn" "OpenVPN started"
+	else
+		/etc/init.d/openvpn stop >/dev/null 2>&1 || true
+		logger -t pocket-ap-switch "OpenVPN stopped via hardware switch"
+		record_event "$WANT" "vpn_openvpn" "OpenVPN stopped"
+	fi
+}
+
+blink_led_reset() {
+	LED_DIR=""
+	for d in /sys/class/leds/*white* /sys/class/leds/*blue* /sys/class/leds/*; do
+		if [ -w "$d/trigger" ]; then
+			LED_DIR="$d"
+			break
+		fi
+	done
+	if [ -n "$LED_DIR" ]; then
+		echo timer > "$LED_DIR/trigger" 2>/dev/null || true
+		echo 100 > "$LED_DIR/delay_on" 2>/dev/null || true
+		echo 100 > "$LED_DIR/delay_off" 2>/dev/null || true
+	fi
+}
+
+restore_led() {
+	for d in /sys/class/leds/*white* /sys/class/leds/*blue*; do
+		[ -w "$d/trigger" ] && echo default-on > "$d/trigger" 2>/dev/null || true
+	done
+}
+
+do_reset_defaults() {
+	WANT="$1"
+	if [ "$WANT" = "off" ]; then
+		# Cancel pending 5-second armed reset!
+		if [ -f "$RESET_PID_FILE" ]; then
+			RPID="$(cat "$RESET_PID_FILE" 2>/dev/null || true)"
+			[ -n "$RPID" ] && kill "$RPID" 2>/dev/null || true
+			rm -f "$RESET_PID_FILE"
+			restore_led
+			logger -t pocket-ap-switch "Factory reset cancelled (switch slid back OFF)"
+			record_event "off" "reset_defaults" "Reset cancelled safely"
+		fi
+		return
+	fi
+
+	# Slide ON -> arm 5-second countdown with fast LED blink so accidental bumps can be cancelled
+	logger -t pocket-ap-switch "Factory reset ARMED — slide switch OFF within 5 seconds to cancel!"
+	record_event "on" "reset_defaults" "Reset armed (5s cancel window)"
+	blink_led_reset
+	(
+		sleep 5
+		CUR="$(read_gpio_pos)"
+		[ "$SW_INVERT" = "true" ] && { [ "$CUR" = "on" ] && CUR="off" || CUR="on"; }
+		if [ "$CUR" = "on" ]; then
+			logger -t pocket-ap-switch "Executing factory reset via hardware switch!"
+			rm -f "$RESET_PID_FILE"
+			if command -v factoryreset >/dev/null 2>&1; then
+				factoryreset -y && reboot
+			else
+				jffs2reset -y && reboot
+			fi
+		else
+			restore_led
+			rm -f "$RESET_PID_FILE"
+		fi
+	) </dev/null >/dev/null 2>&1 &
+	echo $! > "$RESET_PID_FILE"
+}
+
+handle_event() {
+	RAW_EVENT="${1:-}"
+	load_cfg
+
+	if [ "$RAW_EVENT" = "pressed" ] || [ "$RAW_EVENT" = "on" ]; then
+		LOGICAL="on"
+	elif [ "$RAW_EVENT" = "released" ] || [ "$RAW_EVENT" = "off" ]; then
+		LOGICAL="off"
+	else
+		LOGICAL="$(read_gpio_pos)"
+	fi
+
+	if [ "$SW_INVERT" = "true" ]; then
+		if [ "$LOGICAL" = "on" ]; then LOGICAL="off"
+		elif [ "$LOGICAL" = "off" ]; then LOGICAL="on"
+		fi
+	fi
+
+	case "$SW_ACTION" in
+		none)
+			record_event "$LOGICAL" "none" "No action configured"
+			;;
+		wifi)
+			do_wifi "$LOGICAL"
+			;;
+		vpn_wireguard)
+			do_wireguard "$LOGICAL"
+			;;
+		vpn_openvpn)
+			do_openvpn "$LOGICAL"
+			;;
+		reset_defaults)
+			do_reset_defaults "$LOGICAL"
+			;;
+	esac
+}
+
+case "${1:-}" in
+	event) handle_event "${2:-}" ;;
+	pos)   read_gpio_pos ;;
+	*)     exit 0 ;;
+esac

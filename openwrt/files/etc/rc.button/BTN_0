@@ -1,0 +1,5 @@
+#!/bin/sh
+# OpenWrt procd button handler for GL.iNet GL-MT3000 hardware side toggle switch (BTN_0)
+[ -x /usr/libexec/pocket-ap-switch ] || exit 0
+/usr/libexec/pocket-ap-switch event "$ACTION" &
+exit 0

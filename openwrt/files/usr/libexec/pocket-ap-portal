@@ -1,0 +1,371 @@
+#!/bin/sh
+# Pocket-AP Captive Portal Login Mode & Auto-Restore Watchdog
+# Safely relaxes DNS rebind protection, custom DNS forwarders, Adblock, and VPN kill-switch
+# while signing into a hotel/airport/guest captive portal, then automatically restores
+# every safeguard as soon as real internet connectivity returns (or timeout elapses).
+
+set -u
+
+STATE_FILE="/tmp/pocket-ap-portal.state"
+PID_FILE="/tmp/pocket-ap-portal.pid"
+PROBE_FILE="/tmp/pocket-ap-portal.probe"
+LAST_FILE="/tmp/pocket-ap-portal.last"
+ADBLOCK_PERSIST="/etc/pocket-ap/adblock-domains.txt"
+ADBLOCK_BASENAME="pocket-ap-adblock.conf"
+PORTAL_CONF_BASENAME="pocket-ap-portal.conf"
+
+resolve_dnsmasq_dir() {
+	for d in /tmp/dnsmasq.*.d; do
+		if [ -d "$d" ]; then
+			echo "$d"
+			return
+		fi
+	done
+	mkdir -p /tmp/dnsmasq.d
+	echo "/tmp/dnsmasq.d"
+}
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'
+}
+
+get_wwan_info() {
+	WWAN_JSON="$(ubus call network.interface.wwan status 2>/dev/null || echo '{}')"
+	WWAN_UP="$(printf '%s' "$WWAN_JSON" | jsonfilter -e '@.up' 2>/dev/null || echo 'false')"
+	WWAN_DEV="$(printf '%s' "$WWAN_JSON" | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
+	[ -z "$WWAN_DEV" ] && WWAN_DEV="$(printf '%s' "$WWAN_JSON" | jsonfilter -e '@.device' 2>/dev/null || true)"
+	WWAN_GW="$(printf '%s' "$WWAN_JSON" | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' 2>/dev/null | head -n 1 || true)"
+	WWAN_DNS="$(printf '%s' "$WWAN_JSON" | jsonfilter -e '@["dns-server"][*]' 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+	WWAN_SEARCH="$(printf '%s' "$WWAN_JSON" | jsonfilter -e '@["dns-search"][*]' 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+}
+
+probe_portal() {
+	OUT=""
+	RC=1
+	if [ -x /bin/uclient-fetch ] || [ -x /usr/bin/uclient-fetch ]; then
+		OUT="$(uclient-fetch -4 -T 5 -O - http://detectportal.firefox.com/success.txt 2>&1)"
+		RC=$?
+	elif [ -x /usr/bin/wget ]; then
+		OUT="$(wget -T 5 -S -O - http://detectportal.firefox.com/success.txt 2>&1)"
+		RC=$?
+	fi
+
+	# Real Firefox success.txt returns literally "success"
+	ONLINE="false"
+	if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -qx "success"; then
+		ONLINE="true"
+	fi
+
+	# Extract redirect URL if captive portal intercepted the HTTP request
+	PORTAL_URL="$(printf '%s\n' "$OUT" | sed -nE 's/.*[Ll]ocation:[[:space:]]*(https?:\/\/[^[:space:]"'\''<>]+).*/\1/p' | head -n 1)"
+	if [ -z "$PORTAL_URL" ]; then
+		PORTAL_URL="$(printf '%s\n' "$OUT" | sed -nE 's/.*Redirected to (https?:\/\/[^[:space:]"'\''<>]+).*/\1/p' | head -n 1)"
+	fi
+	if [ -z "$PORTAL_URL" ]; then
+		PORTAL_URL="$(printf '%s\n' "$OUT" | sed -nE 's/.*url=(https?:\/\/[^[:space:]"'\''<>]+).*/\1/ip' | head -n 1)"
+	fi
+
+	DETECTED="false"
+	if [ "$ONLINE" = "false" ] && { [ -n "$PORTAL_URL" ] || [ "$RC" -eq 0 ]; }; then
+		DETECTED="true"
+	fi
+
+	NOW="$(date +%s)"
+	cat > "$PROBE_FILE" <<EOF
+PROBE_AT=$NOW
+PROBE_ONLINE=$ONLINE
+PROBE_DETECTED=$DETECTED
+PROBE_URL="$(json_escape "$PORTAL_URL")"
+EOF
+}
+
+cmd_start() {
+	TIMEOUT="${1:-600}"
+	case "$TIMEOUT" in
+		''|*[!0-9]*) TIMEOUT=600 ;;
+	esac
+	[ "$TIMEOUT" -lt 60 ] && TIMEOUT=60
+	[ "$TIMEOUT" -gt 1800 ] && TIMEOUT=1800
+
+	# If already active, stop old watchdog cleanly before refreshing timer
+	if [ -f "$PID_FILE" ]; then
+		OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+		[ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
+		rm -f "$PID_FILE"
+	fi
+
+	get_wwan_info
+	DNSMASQ_DIR="$(resolve_dnsmasq_dir)"
+	PORTAL_CONF="$DNSMASQ_DIR/$PORTAL_CONF_BASENAME"
+	ADBLOCK_CONF="$DNSMASQ_DIR/$ADBLOCK_BASENAME"
+
+	# Only snapshot original settings if not already in an active portal session
+	if [ ! -f "$STATE_FILE" ]; then
+		ORIG_REBIND="$(uci -q get dhcp.@dnsmasq[0].rebind_protection || echo '1')"
+		ORIG_SERVERS="$(uci -q get dhcp.@dnsmasq[0].server || true)"
+		ORIG_ADBLOCK="0"
+		[ -f "$ADBLOCK_CONF" ] && ORIG_ADBLOCK="1"
+
+		ORIG_KILLSWITCH="0"
+		LAN_WAN_IDX=""
+		i=0
+		while uci -q get "firewall.@forwarding[$i]" >/dev/null 2>&1; do
+			SRC="$(uci -q get "firewall.@forwarding[$i].src" || true)"
+			DST="$(uci -q get "firewall.@forwarding[$i].dest" || true)"
+			if [ "$SRC" = "lan" ] && [ "$DST" = "wan" ]; then
+				LAN_WAN_IDX="$i"
+				EN="$(uci -q get "firewall.@forwarding[$i].enabled" || echo '1')"
+				[ "$EN" = "0" ] && ORIG_KILLSWITCH="1"
+				break
+			fi
+			i=$((i + 1))
+		done
+
+		# Record if Ethernet wan currently holds the default route while wwan is also up
+		ORIG_DEF_ROUTE="$(ip route show default 2>/dev/null | head -n 1 || true)"
+		ROUTE_SWITCHED="0"
+
+		cat > "$STATE_FILE" <<EOF
+STARTED_AT=$(date +%s)
+EXPIRES_AT=$(( $(date +%s) + TIMEOUT ))
+ORIG_REBIND='$ORIG_REBIND'
+ORIG_SERVERS='$ORIG_SERVERS'
+ORIG_ADBLOCK='$ORIG_ADBLOCK'
+ORIG_KILLSWITCH='$ORIG_KILLSWITCH'
+LAN_WAN_IDX='$LAN_WAN_IDX'
+ORIG_DEF_ROUTE='$ORIG_DEF_ROUTE'
+ROUTE_SWITCHED='$ROUTE_SWITCHED'
+ADDED_DNS_ROUTES=''
+EOF
+	else
+		# Extend expiration timer on existing active session
+		. "$STATE_FILE"
+		EXPIRES_AT=$(( $(date +%s) + TIMEOUT ))
+		sed -i "s/^EXPIRES_AT=.*/EXPIRES_AT=$EXPIRES_AT/" "$STATE_FILE"
+	fi
+
+	. "$STATE_FILE"
+
+	# 1. Temporarily relax DNS rebind protection & custom upstream forwarders
+	uci -q set dhcp.@dnsmasq[0].rebind_protection='0'
+	uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null || true
+	uci -q commit dhcp
+
+	# 2. Pause Pocket-AP custom Adblock so portal auth/CDN scripts aren't sinkholed
+	[ -f "$ADBLOCK_CONF" ] && rm -f "$ADBLOCK_CONF"
+
+	# 3. Temporarily pause VPN Kill-Switch so portal login traffic can reach wwan
+	if [ "$ORIG_KILLSWITCH" = "1" ] && [ -n "$LAN_WAN_IDX" ]; then
+		uci -q set "firewall.@forwarding[$LAN_WAN_IDX].enabled=1"
+		uci -q commit firewall
+		/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	fi
+
+	# 4. Route WWAN DHCP DNS servers explicitly via WWAN & pin captive-portal search domains in dnsmasq
+	{
+		echo "# Temporary Pocket-AP Captive Portal Mode (auto-reverts when online)"
+		echo "strict-order"
+	} > "$PORTAL_CONF"
+
+	ADDED_ROUTES=""
+	if [ "$WWAN_UP" = "true" ] && [ -n "$WWAN_GW" ] && [ -n "$WWAN_DEV" ]; then
+		for dns in $WWAN_DNS; do
+			case "$dns" in
+				*[!0-9.]*) continue ;;
+			esac
+			ip route replace "$dns/32" via "$WWAN_GW" dev "$WWAN_DEV" 2>/dev/null || true
+			ADDED_ROUTES="$ADDED_ROUTES $dns"
+			echo "server=$dns" >> "$PORTAL_CONF"
+			for dom in $WWAN_SEARCH; do
+				case "$dom" in
+					*[!A-Za-z0-9.-]*) continue ;;
+				esac
+				echo "server=/$dom/$dns" >> "$PORTAL_CONF"
+				echo "rebind-domain-ok=/$dom/" >> "$PORTAL_CONF"
+			done
+		done
+
+		# If Ethernet wan is ALSO up and owns default route, temporarily prefer wwan so portal HTTP goes out wwan
+		case "$ORIG_DEF_ROUTE" in
+			*"dev $WWAN_DEV"*) ;;
+			*"dev "*)
+				ip route replace default via "$WWAN_GW" dev "$WWAN_DEV" 2>/dev/null && ROUTE_SWITCHED="1"
+				;;
+		esac
+	fi
+
+	sed -i "s|^ROUTE_SWITCHED=.*|ROUTE_SWITCHED='$ROUTE_SWITCHED'|" "$STATE_FILE"
+	sed -i "s|^ADDED_DNS_ROUTES=.*|ADDED_DNS_ROUTES='$(echo "$ADDED_ROUTES" | sed 's/^ //')'|" "$STATE_FILE"
+
+	# 5. Restart dnsmasq to flush negative NXDOMAIN cache immediately
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+
+	# 6. Probe immediately so UI has fresh portal URL if redirected
+	probe_portal
+
+	# 7. Spawn detached auto-restore watchdog
+	/usr/libexec/pocket-ap-portal watch </dev/null >/dev/null 2>&1 &
+	echo $! > "$PID_FILE"
+
+	cmd_status
+}
+
+cmd_restore() {
+	REASON="${1:-manual}"
+
+	# Stop watchdog if running (avoid killing ourselves if called from watch)
+	if [ -f "$PID_FILE" ]; then
+		WPID="$(cat "$PID_FILE" 2>/dev/null || true)"
+		if [ -n "$WPID" ] && [ "$WPID" != "$$" ]; then
+			kill "$WPID" 2>/dev/null || true
+		fi
+		rm -f "$PID_FILE"
+	fi
+
+	DNSMASQ_DIR="$(resolve_dnsmasq_dir)"
+	PORTAL_CONF="$DNSMASQ_DIR/$PORTAL_CONF_BASENAME"
+	ADBLOCK_CONF="$DNSMASQ_DIR/$ADBLOCK_BASENAME"
+
+	rm -f "$PORTAL_CONF"
+
+	if [ -f "$STATE_FILE" ]; then
+		. "$STATE_FILE"
+
+		# 1. Restore DNS rebind protection & original custom DNS servers
+		uci -q set "dhcp.@dnsmasq[0].rebind_protection=${ORIG_REBIND:-1}"
+		uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null || true
+		if [ -n "${ORIG_SERVERS:-}" ]; then
+			for s in $ORIG_SERVERS; do
+				uci -q add_list "dhcp.@dnsmasq[0].server=$s"
+			done
+		fi
+		uci -q commit dhcp
+
+		# 2. Restore Pocket-AP Adblock if it was previously active
+		if [ "${ORIG_ADBLOCK:-0}" = "1" ] && [ -f "$ADBLOCK_PERSIST" ]; then
+			{
+				echo "# Generated by Pocket-AP"
+				while IFS= read -r d; do
+					[ -z "$d" ] && continue
+					echo "address=/$d/0.0.0.0"
+					echo "address=/$d/::"
+				done < "$ADBLOCK_PERSIST"
+			} > "$ADBLOCK_CONF"
+		fi
+
+		# 3. Restore VPN Kill-Switch if it was paused
+		if [ "${ORIG_KILLSWITCH:-0}" = "1" ] && [ -n "${LAN_WAN_IDX:-}" ]; then
+			uci -q set "firewall.@forwarding[$LAN_WAN_IDX].enabled=0"
+			uci -q commit firewall
+			/etc/init.d/firewall reload >/dev/null 2>&1 || true
+		fi
+
+		# 4. Remove temporary /32 DNS routes & restore original default route if switched
+		for dns in ${ADDED_DNS_ROUTES:-}; do
+			ip route del "$dns/32" 2>/dev/null || true
+		done
+		if [ "${ROUTE_SWITCHED:-0}" = "1" ] && [ -n "${ORIG_DEF_ROUTE:-}" ]; then
+			# shellcheck disable=SC2086
+			ip route replace $ORIG_DEF_ROUTE 2>/dev/null || true
+		fi
+
+		rm -f "$STATE_FILE"
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+	fi
+
+	cat > "$LAST_FILE" <<EOF
+LAST_RESTORED_AT=$(date +%s)
+LAST_REASON="$(json_escape "$REASON")"
+EOF
+
+	[ "$REASON" = "connected" ] || rm -f "$PROBE_FILE"
+	cmd_status
+}
+
+cmd_watch() {
+	STREAK=0
+	while [ -f "$STATE_FILE" ]; do
+		sleep 5
+		[ -f "$STATE_FILE" ] || exit 0
+		. "$STATE_FILE"
+		NOW="$(date +%s)"
+		if [ "$NOW" -ge "${EXPIRES_AT:-0}" ]; then
+			cmd_restore "timeout" >/dev/null 2>&1
+			exit 0
+		fi
+		probe_portal
+		. "$PROBE_FILE"
+		if [ "${PROBE_ONLINE:-false}" = "true" ]; then
+			STREAK=$((STREAK + 1))
+			if [ "$STREAK" -ge 2 ]; then
+				cmd_restore "connected" >/dev/null 2>&1
+				exit 0
+			fi
+		else
+			STREAK=0
+		fi
+	done
+}
+
+cmd_status() {
+	get_wwan_info
+	NOW="$(date +%s)"
+	ACTIVE="false"
+	STARTED_AT=0
+	EXPIRES_AT=0
+	REMAINING=0
+	ORIG_ADBLOCK="0"
+	ORIG_KILLSWITCH="0"
+	ROUTE_SWITCHED="0"
+
+	if [ -f "$STATE_FILE" ]; then
+		. "$STATE_FILE"
+		ACTIVE="true"
+		REMAINING=$(( ${EXPIRES_AT:-0} - NOW ))
+		[ "$REMAINING" -lt 0 ] && REMAINING=0
+	fi
+
+	PROBE_AT=0
+	PROBE_ONLINE="false"
+	PROBE_DETECTED="false"
+	PROBE_URL=""
+	if [ -f "$PROBE_FILE" ]; then
+		. "$PROBE_FILE"
+	fi
+
+	LAST_RESTORED_AT=0
+	LAST_REASON=""
+	if [ -f "$LAST_FILE" ]; then
+		. "$LAST_FILE"
+	fi
+
+	printf '{"active":%s,"started_at":%s,"expires_at":%s,"remaining_sec":%s,"wwan_up":%s,"wwan_dev":"%s","wwan_gw":"%s","wwan_dns":"%s","wwan_search":"%s","online":%s,"portal_detected":%s,"portal_url":"%s","probe_at":%s,"adblock_paused":%s,"killswitch_paused":%s,"route_switched":%s,"last_restored_at":%s,"last_reason":"%s"}\n' \
+		"$ACTIVE" \
+		"${STARTED_AT:-0}" \
+		"${EXPIRES_AT:-0}" \
+		"$REMAINING" \
+		"${WWAN_UP:-false}" \
+		"$(json_escape "${WWAN_DEV:-}")" \
+		"$(json_escape "${WWAN_GW:-}")" \
+		"$(json_escape "${WWAN_DNS:-}")" \
+		"$(json_escape "${WWAN_SEARCH:-}")" \
+		"${PROBE_ONLINE:-false}" \
+		"${PROBE_DETECTED:-false}" \
+		"$(json_escape "${PROBE_URL:-}")" \
+		"${PROBE_AT:-0}" \
+		"$([ "${ORIG_ADBLOCK:-0}" = "1" ] && echo true || echo false)" \
+		"$([ "${ORIG_KILLSWITCH:-0}" = "1" ] && echo true || echo false)" \
+		"$([ "${ROUTE_SWITCHED:-0}" = "1" ] && echo true || echo false)" \
+		"${LAST_RESTORED_AT:-0}" \
+		"$(json_escape "${LAST_REASON:-}")"
+}
+
+case "${1:-status}" in
+	start)   cmd_start "${2:-600}" ;;
+	restore) cmd_restore "${2:-manual}" ;;
+	stop)    cmd_restore "manual" ;;
+	probe)   probe_portal; cmd_status ;;
+	watch)   cmd_watch ;;
+	status)  cmd_status ;;
+	*)       echo '{"error":"unknown action"}' >&2; exit 1 ;;
+esac

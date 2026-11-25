@@ -1,0 +1,43 @@
+{
+  "pocket-ap": {
+    "description": "Pocket-AP travel router web interface — least-privilege administrative access",
+    "read": {
+      "ubus": {
+        "session": [ "access", "get", "list" ],
+        "system": [ "board", "info" ],
+        "uci": [ "get", "state", "changes" ],
+        "network.interface": [ "dump" ],
+        "luci": [
+          "getUSBDevices",
+          "getRealtimeStats"
+        ],
+        "luci-rpc": [
+          "getNetworkDevices",
+          "getWirelessDevices",
+          "getHostHints",
+          "getDHCPLeases"
+        ],
+        "iwinfo": [
+          "info",
+          "scan",
+          "assoclist"
+        ],
+        "hostapd.*": [ "get_clients" ],
+        "rc": [ "list" ],
+        "log": [ "read" ],
+        "pocket-ap": [ "telemetry", "diag", "adblock_get", "wifi_profiles_get", "landing_get", "portal_status", "portal_probe", "switch_get" ]
+      },
+      "uci": [ "wireless", "network", "dhcp", "firewall", "system" ]
+    },
+    "write": {
+      "ubus": {
+        "uci": [ "add", "set", "delete", "revert", "commit", "apply", "confirm", "rollback" ],
+        "luci": [ "setInitAction", "setPassword" ],
+        "system": [ "reboot" ],
+        "session": [ "destroy" ],
+        "pocket-ap": [ "adblock_set", "wifi_profiles_save", "landing_set", "portal_start", "portal_stop", "switch_set" ]
+      },
+      "uci": [ "wireless", "network", "dhcp", "firewall", "system" ]
+    }
+  }
+}
